@@ -63,25 +63,18 @@ PIPELINES = {
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def load_locations(table: str) -> list[dict]:
-    """Return sorted unique (loc, loc_name) pairs for the sidebar."""
+    """Return sorted unique (loc, loc_name) pairs via Supabase RPC."""
+    rpc_url = (
+        f"{st.secrets['SUPABASE_URL'].rstrip('/')}"
+        f"/rest/v1/rpc/distinct_locations_{table}"
+    )
     resp = requests.get(
-        _base_url(table),
+        rpc_url,
         headers={**_headers(), "Accept": "application/json"},
-        params=[
-            ("select", "loc,loc_name"),
-            ("order",  "loc_name"),
-            ("limit",  10000),
-        ],
         timeout=30,
     )
     resp.raise_for_status()
-    seen, out = set(), []
-    for r in resp.json():
-        k = (r["loc"], r["loc_name"])
-        if k not in seen:
-            seen.add(k)
-            out.append({"id": r["loc"], "name": r["loc_name"]})
-    return out
+    return [{"id": r["loc"], "name": r["loc_name"]} for r in resp.json()]
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
