@@ -1,14 +1,15 @@
 """
 FP Foundry — Natural Gas Pipeline Intelligence
-Streamlit web app serving Iroquois OAC data from Supabase.
+Streamlit web app serving Iroquois OAC data from Supabase PostgREST API.
+Uses requests (not supabase-py) for maximum compatibility.
 """
 
 import io
 from datetime import date, timedelta
 
 import pandas as pd
+import requests
 import streamlit as st
-from supabase import create_client, Client
 
 # ---------------------------------------------------------------------------
 # Page config
@@ -21,14 +22,18 @@ st.set_page_config(
 )
 
 # ---------------------------------------------------------------------------
-# Supabase connection (cached for the session)
+# Supabase REST helpers
 # ---------------------------------------------------------------------------
-@st.cache_resource
-def get_client() -> Client:
-    return create_client(
-        st.secrets["SUPABASE_URL"],
-        st.secrets["SUPABASE_KEY"],
-    )
+def _headers() -> dict:
+    key = st.secrets["SUPABASE_KEY"]
+    return {
+        "apikey":        key,
+        "Authorization": f"Bearer {key}",
+        "Content-Type":  "application/json",
+    }
+
+def _base_url(table: str) -> str:
+    return f"{st.secrets['SUPABASE_URL'].rstrip('/')}/rest/v1/{table}"
 
 
 # ---------------------------------------------------------------------------
@@ -59,15 +64,18 @@ PIPELINES = {
 @st.cache_data(ttl=3600, show_spinner=False)
 def load_locations(table: str) -> list[dict]:
     """Return sorted unique (loc, loc_name) pairs for the sidebar."""
-    sb = get_client()
-    res = (
-        sb.table(table)
-        .select("loc, loc_name")
-        .order("loc_name")
-        .execute()
+    resp = requests.get(
+        _base_url(table),
+        headers={**_headers(), "Accept": "application/json"},
+        params={
+            "select":  "loc,loc_name",
+            "order":   "loc_name",
+        },
+        timeout=30,
     )
+    resp.raise_for_status()
     seen, out = set(), []
-    for r in res.data:
+    for r in resp.json():
         k = (r["loc"], r["loc_name"])
         if k not in seen:
             seen.add(k)
@@ -80,28 +88,44 @@ def load_data(
     table: str,
     start: date,
     end: date,
-    loc_ids: tuple,          # tuple so it's hashable for cache
+    loc_ids: tuple,
     purpose: str,
 ) -> pd.DataFrame:
-    """Fetch data from Supabase with pagination, return DataFrame."""
-    sb = get_client()
+    """Fetch data from Supabase PostgREST with pagination, return DataFrame."""
     rows, offset, page_size = [], 0, 1000
 
     while True:
-        q = (
-            sb.table(table)
-            .select("*")
-            .gte("gas_date", str(start))
-            .lte("gas_date", str(end))
-            .order("gas_date", desc=True)
-            .order("loc_name")
-        )
+        params = {
+            "select":   "*",
+            "gas_date": f"gte.{start},lte.{end}",
+            "order":    "gas_date.desc,loc_name",
+            "offset":   offset,
+            "limit":    page_size,
+        }
+        # PostgREST filter syntax
+        param_list = [
+            ("select", "*"),
+            ("gas_date", f"gte.{start}"),
+            ("gas_date", f"lte.{end}"),
+            ("order",   "gas_date.desc"),
+            ("order",   "loc_name"),
+            ("offset",  offset),
+            ("limit",   page_size),
+        ]
         if loc_ids:
-            q = q.in_("loc", list(loc_ids))
+            param_list.append(("loc", f"in.({','.join(str(i) for i in loc_ids)})"))
         if purpose != "All":
-            q = q.ilike("loc_purp_desc", f"%{purpose}%")
+            param_list.append(("loc_purp_desc", f"ilike.*{purpose}*"))
 
-        chunk = q.range(offset, offset + page_size - 1).execute().data
+        resp = requests.get(
+            _base_url(table),
+            headers={**_headers(), "Accept": "application/json",
+                     "Prefer": "count=none"},
+            params=param_list,
+            timeout=30,
+        )
+        resp.raise_for_status()
+        chunk = resp.json()
         rows.extend(chunk)
         if len(chunk) < page_size or offset > 100_000:
             break
