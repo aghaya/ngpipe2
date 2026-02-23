@@ -1,0 +1,31 @@
+name: Daily Iroquois OAC Update
+
+on:
+  schedule:
+    # 10:30 AM UTC = 5:30 AM ET (after Timely cycle posts ~9 AM ET)
+    - cron: "30 10 * * *"
+  workflow_dispatch:   # allows manual trigger from GitHub UI
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run daily updater
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+        run: python update_db.py
