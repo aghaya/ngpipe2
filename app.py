@@ -67,10 +67,11 @@ def load_locations(table: str) -> list[dict]:
     resp = requests.get(
         _base_url(table),
         headers={**_headers(), "Accept": "application/json"},
-        params={
-            "select":  "loc,loc_name",
-            "order":   "loc_name",
-        },
+        params=[
+            ("select", "loc,loc_name"),
+            ("order",  "loc_name"),
+            ("limit",  10000),
+        ],
         timeout=30,
     )
     resp.raise_for_status()
@@ -81,6 +82,31 @@ def load_locations(table: str) -> list[dict]:
             seen.add(k)
             out.append({"id": r["loc"], "name": r["loc_name"]})
     return out
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def load_date_range(table: str) -> tuple[str, str]:
+    """Return (min_date, max_date) strings from the table."""
+    r1 = requests.get(
+        _base_url(table),
+        headers={**_headers(), "Accept": "application/json"},
+        params=[("select", "gas_date"), ("order", "gas_date.asc"),  ("limit", 1)],
+        timeout=30,
+    )
+    r2 = requests.get(
+        _base_url(table),
+        headers={**_headers(), "Accept": "application/json"},
+        params=[("select", "gas_date"), ("order", "gas_date.desc"), ("limit", 1)],
+        timeout=30,
+    )
+    r1.raise_for_status()
+    r2.raise_for_status()
+    d1 = r1.json()
+    d2 = r2.json()
+    return (
+        d1[0]["gas_date"] if d1 else "—",
+        d2[0]["gas_date"] if d2 else "—",
+    )
 
 
 @st.cache_data(ttl=300, show_spinner=False)
@@ -95,22 +121,14 @@ def load_data(
     rows, offset, page_size = [], 0, 1000
 
     while True:
-        params = {
-            "select":   "*",
-            "gas_date": f"gte.{start},lte.{end}",
-            "order":    "gas_date.desc,loc_name",
-            "offset":   offset,
-            "limit":    page_size,
-        }
-        # PostgREST filter syntax
         param_list = [
-            ("select", "*"),
+            ("select",   "*"),
             ("gas_date", f"gte.{start}"),
             ("gas_date", f"lte.{end}"),
-            ("order",   "gas_date.desc"),
-            ("order",   "loc_name"),
-            ("offset",  offset),
-            ("limit",   page_size),
+            ("order",    "gas_date.desc"),
+            ("order",    "loc_name"),
+            ("offset",   offset),
+            ("limit",    page_size),
         ]
         if loc_ids:
             param_list.append(("loc", f"in.({','.join(str(i) for i in loc_ids)})"))
@@ -161,49 +179,68 @@ with st.sidebar:
     pipeline_name = st.selectbox("Pipeline", list(PIPELINES.keys()))
     table = PIPELINES[pipeline_name]
 
-    st.subheader("Filters")
-
-    col1, col2 = st.columns(2)
-    with col1:
-        start_date = st.date_input(
-            "From",
-            value=date.today() - timedelta(days=30),
-            min_value=date(2010, 1, 1),
-            max_value=date.today(),
-        )
-    with col2:
-        end_date = st.date_input(
-            "To",
-            value=date.today(),
-            min_value=date(2010, 1, 1),
-            max_value=date.today(),
-        )
-
-    if start_date > end_date:
-        st.error("Start date must be before end date.")
-        st.stop()
-
-    # Location multiselect
+    # Load locations outside the form (needed to populate multiselect options)
     with st.spinner("Loading locations..."):
         all_locs = load_locations(table)
     loc_options = {loc["name"]: loc["id"] for loc in all_locs}
 
-    selected_loc_names = st.multiselect(
-        "Locations",
-        options=list(loc_options.keys()),
-        default=[],
-        placeholder="All locations",
-    )
-    selected_loc_ids = tuple(loc_options[n] for n in selected_loc_names)
+    st.subheader("Filters")
 
-    purpose = st.selectbox(
-        "Flow Purpose",
-        ["All", "Receipt", "Delivery"],
-    )
+    with st.form("filters_form"):
+        col1, col2 = st.columns(2)
+        with col1:
+            start_date = st.date_input(
+                "From",
+                value=date.today() - timedelta(days=30),
+                min_value=date(2010, 1, 1),
+                max_value=date.today(),
+            )
+        with col2:
+            end_date = st.date_input(
+                "To",
+                value=date.today(),
+                min_value=date(2010, 1, 1),
+                max_value=date.today(),
+            )
 
+        selected_loc_names = st.multiselect(
+            "Locations",
+            options=list(loc_options.keys()),
+            default=[],
+            placeholder="All locations",
+        )
+
+        purpose = st.selectbox(
+            "Flow Purpose",
+            ["All", "Receipt", "Delivery"],
+        )
+
+        st.form_submit_button(
+            "Execute",
+            use_container_width=True,
+            type="primary",
+        )
+
+    # Date range info
+    with st.spinner(""):
+        min_dt, max_dt = load_date_range(table)
     st.divider()
-    st.caption("Data: Iroquois Gas Transmission EBB  \nUpdated daily via GitHub Actions")
+    st.caption(
+        f"Data: Iroquois Gas Transmission EBB  \n"
+        f"Updated daily via GitHub Actions  \n"
+        f"Last update: **{max_dt}**  \n"
+        f"Available: {min_dt} – {max_dt}"
+    )
 
+
+# ---------------------------------------------------------------------------
+# Validate date order
+# ---------------------------------------------------------------------------
+if start_date > end_date:
+    st.error("Start date must be before end date.")
+    st.stop()
+
+selected_loc_ids = tuple(loc_options[n] for n in selected_loc_names)
 
 # ---------------------------------------------------------------------------
 # Main content
@@ -216,6 +253,15 @@ st.caption(
 
 with st.spinner("Fetching data..."):
     df = load_data(table, start_date, end_date, selected_loc_ids, purpose)
+
+# --- Download CSV (top of page) ---
+if not df.empty:
+    st.download_button(
+        label="Download CSV",
+        data=df_to_csv_bytes(df),
+        file_name=f"iroquois_oac_{start_date}_{end_date}.csv",
+        mime="text/csv",
+    )
 
 if df.empty:
     st.warning("No data found for the selected filters. Try adjusting the date range or location.")
@@ -249,14 +295,6 @@ for col in ("Design Cap (MMBtu)", "Operating Cap (MMBtu)",
         )
 
 st.dataframe(display_df, use_container_width=True, height=500)
-
-# --- Download ---
-st.download_button(
-    label="Download CSV",
-    data=df_to_csv_bytes(df),
-    file_name=f"iroquois_oac_{start_date}_{end_date}.csv",
-    mime="text/csv",
-)
 
 st.caption(
     "Source: [Iroquois Gas Transmission EBB](https://ioly.iroquois.com/infopost/#operationallyavailable) | "
